@@ -728,3 +728,60 @@ class TestStreamingExtraction:
         }
 
         assert args_text.count("replace_all") == 1
+
+    def test_streaming_boundary_in_single_delta(self, parser, mock_request):
+        """Two tool calls whose boundary `<tool_call|><|tool_call>` arrives
+        in a single delta (the scenario produced by speculative decoding
+        when draft tokens straddle the boundary).
+
+        Regression: the closing `"}` of the first call used to be dropped
+        because Case 2 (new tool call) incremented `current_tool_id` before
+        Case 3 (tool call ended) flushed the closing diff, so the flush
+        indexed the not-yet-complete new call and returned None.
+        """
+        chunks = [
+            "<|tool_call>",
+            "call:write{",
+            'content:<|"|>Line 1\n<|"|>,',
+            'path:<|"|>/tmp/a.txt<|"|>}<tool_call|><|tool_call>',
+            "call:append{",
+            'path:<|"|>/tmp/a.txt<|"|>,',
+            'text:<|"|>Line 2\n<|"|>}',
+            "<tool_call|>",
+        ]
+
+        results = self._simulate_streaming(parser, mock_request, chunks)
+
+        # Collect args per tool call index.
+        per_call_args: dict[int, str] = {}
+        per_call_name: dict[int, str] = {}
+        for delta, _ in results:
+            if not delta or not delta.tool_calls:
+                continue
+            for tc in delta.tool_calls:
+                idx = tc.index
+                func = tc.function if isinstance(tc.function, dict) else tc.function
+                if isinstance(func, dict):
+                    name = func.get("name")
+                    arg = func.get("arguments", "") or ""
+                else:
+                    name = getattr(func, "name", None)
+                    arg = getattr(func, "arguments", "") or ""
+                if name and idx not in per_call_name:
+                    per_call_name[idx] = name
+                if arg:
+                    per_call_args[idx] = per_call_args.get(idx, "") + arg
+
+        assert per_call_name.get(0) == "write"
+        assert per_call_name.get(1) == "append"
+
+        # Both calls must produce VALID JSON arguments. The first call's
+        # trailing `"}` must not be dropped.
+        assert json.loads(per_call_args[0]) == {
+            "content": "Line 1\n",
+            "path": "/tmp/a.txt",
+        }
+        assert json.loads(per_call_args[1]) == {
+            "path": "/tmp/a.txt",
+            "text": "Line 2\n",
+        }

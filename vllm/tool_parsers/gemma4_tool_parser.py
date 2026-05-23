@@ -549,8 +549,35 @@ class Gemma4ToolParser(ToolParser):
                 return DeltaMessage(content=delta_text)
             return None
 
-        # Case 2: Starting a new tool call
-        if start_count > prev_start_count and start_count > end_count:
+        new_call_started = start_count > prev_start_count and start_count > end_count
+        call_ended = end_count > prev_end_count
+
+        # Case 3: Tool call just ended. Handle BEFORE advancing state for a
+        # new tool call so the closing-args flush uses the just-ended
+        # call's id, not the new one. With speculative decoding a single
+        # delta can contain both `<tool_call|>` (end of previous call)
+        # and `<|tool_call>call:next{...` (start of the next), and the
+        # previous-call closing characters (e.g. `"}`) would otherwise be
+        # lost because `_handle_tool_call_end` would index by the
+        # already-incremented id.
+        if call_ended:
+            end_msg = self._handle_tool_call_end(current_text)
+            if new_call_started:
+                # A new tool call also opened in this same delta — advance
+                # state so the next delta's Case 4 (middle) handles its
+                # args correctly.
+                self.current_tool_id += 1
+                self.current_tool_name_sent = False
+                self.streamed_args_for_tool.append("")
+                self.prev_tool_call_arr.append({})
+                logger.debug(
+                    "Starting new tool call %d (boundary in one delta)",
+                    self.current_tool_id,
+                )
+            return end_msg
+
+        # Case 2: Starting a new tool call (no end token in this delta)
+        if new_call_started:
             self.current_tool_id += 1
             self.current_tool_name_sent = False
             self.streamed_args_for_tool.append("")
@@ -561,10 +588,6 @@ class Gemma4ToolParser(ToolParser):
             # (but usually it's just the token itself, so return None)
             if len(delta_text) <= len(self.tool_call_start_token):
                 return None
-
-        # Case 3: Tool call just ended
-        if end_count > prev_end_count:
-            return self._handle_tool_call_end(current_text)
 
         # Case 4: In the middle of a tool call — parse partial content
         if start_count > end_count:
